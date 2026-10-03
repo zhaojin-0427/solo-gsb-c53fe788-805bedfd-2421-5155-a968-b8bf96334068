@@ -1,14 +1,18 @@
 """SQLite 元数据层。
 
-单进程内所有连接访问都通过一把 RLock 串行化；SQLite 开启 WAL，
-写事务由 `with conn:` 保证提交/回滚。表设计：
+每个进程持有一个连接，进程内访问通过一把 RLock 串行化；SQLite 开启 WAL，
+写事务由 `with conn:` 保证提交/回滚，并设置 busy_timeout——多个进程挂载同一
+数据目录时，写锁冲突会等待而非立刻报错。表设计：
 
 - blobs       全局内容寻址 blob（按摘要去重）
 - repo_blobs  repo -> blob 的命名空间关联（同一 blob 可被多个 repo 可见）
 - uploads     上传会话（落盘持久化，重启后可恢复/续传）
 - manifests   repo 内按摘要不可变存储的 manifest
 - tags        repo 内 tag -> manifest digest（CAS 更新）
-- gc_plans    GC 复核计划（dry-run 快照，持久化、1h 有效、只能执行一次）
+- gc_plans    GC 复核计划（dry-run 快照，持久化、1h 有效、只能执行一次）。
+              state: pending -> executing（原子认领，已提交，跨进程互斥）
+                     -> executed；认领后崩溃则永久停留在 executing，
+                     不可重放，只能重新 dry-run
 - gc_plan_blobs / gc_plan_manifests / gc_plan_uploads  计划内候选清单
 """
 from __future__ import annotations
@@ -59,11 +63,13 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 CREATE TABLE IF NOT EXISTS gc_plans (
     id           TEXT PRIMARY KEY,
-    state        TEXT NOT NULL,          -- pending | executed
+    state        TEXT NOT NULL,          -- pending | executing | executed
     grace_seconds INTEGER NOT NULL,      -- 生成时记录，执行复核以此为准
     created_at   REAL NOT NULL,
     expires_at   REAL NOT NULL,          -- created_at + 1h，过期计划拒绝执行
-    executed_at  REAL
+    executed_at  REAL,
+    claimed_at   REAL,                   -- 认领为 executing 的时刻（跨进程互斥）
+    claimer      TEXT                    -- 认领者标识（host:pid:instance），仅诊断用
 );
 CREATE TABLE IF NOT EXISTS gc_plan_blobs (
     plan_id    TEXT NOT NULL,
@@ -92,11 +98,27 @@ class Database:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        # timeout + busy_timeout：跨进程共享同一 SQLite 文件时，写者之间
+        # 排队等待而不是立刻抛 database is locked
+        self._conn = sqlite3.connect(
+            str(path), check_same_thread=False, timeout=15.0
+        )
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=15000")
             self._conn.executescript(SCHEMA)
+            self._migrate_gc_plans()
+
+    def _migrate_gc_plans(self):
+        """旧库 gc_plans 只有 pending/executed 两列，补齐认领列。"""
+        cols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(gc_plans)"
+        ).fetchall()}
+        if "claimed_at" not in cols:
+            self._conn.execute("ALTER TABLE gc_plans ADD COLUMN claimed_at REAL")
+        if "claimer" not in cols:
+            self._conn.execute("ALTER TABLE gc_plans ADD COLUMN claimer TEXT")
 
     # ---------------- uploads ----------------
 
@@ -352,20 +374,56 @@ class Database:
             ).fetchall()
             return [r["upload_id"] for r in rows]
 
-    def mark_gc_plan_executed(self, plan_id: str, now: float):
+    def claim_gc_plan(self, plan_id: str, now: float, claimer: str) -> "str | None":
+        """跨进程原子认领计划：仅当计划处于 pending 且未过期时，将其置为
+        executing 并提交。返回认领后的状态：
+
+        - "claimed"   ：本调用认领成功（唯一允许删除候选的一方）
+        - "executing" ：已被其他进程认领（并发竞争失败或认领方已崩溃）
+        - "executed"  ：已经执行完成
+        - None        ：计划不存在（未知或已被清理）
+
+        过期的 pending 计划不在此认领，由调用方先读取 expires_at 判定为
+        410 GC_PLAN_EXPIRED；其余状态原样返回。单条 UPDATE 的写事务在
+        SQLite WAL 下天然串行化，跨进程也只有一个赢家。
+        """
         with self._lock, self._conn:
-            self._conn.execute(
-                "UPDATE gc_plans SET state = 'executed', executed_at = ? WHERE id = ?",
+            cur = self._conn.execute(
+                "UPDATE gc_plans SET state = 'executing', claimed_at = ?,"
+                " claimer = ? WHERE id = ? AND state = 'pending' AND expires_at > ?",
+                (now, claimer, plan_id, now),
+            )
+            if cur.rowcount == 1:
+                return "claimed"
+        row = self.get_gc_plan(plan_id)
+        return None if row is None else row["state"]
+
+    def mark_gc_plan_executed(self, plan_id: str, now: float) -> bool:
+        """认领方在删除全部完成后把 executing 标记为 executed，提交。
+
+        正常路径下该计划必然处于 executing，返回 True；返回 False 只可能
+        来自外部干预（状态被人为改走），调用方不回滚删除。
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE gc_plans SET state = 'executed', executed_at = ?"
+                " WHERE id = ? AND state = 'executing'",
                 (now, plan_id),
             )
+            return cur.rowcount == 1
 
     def prune_gc_plans(self, executed_before: float, pending_before: float):
-        """删除历史计划（已执行且超过保留期，或早已过期仍未执行），防止表无限增长。"""
+        """删除历史计划，防止表无限增长：
+
+        - executed 且 executed_at 超过已执行保留期；
+        - pending / executing 且有效期早已超过（executing 说明认领方已崩溃，
+          计划不可重放，超过保留期后同样清掉）。
+        """
         with self._lock, self._conn:
             ids = [r["id"] for r in self._conn.execute(
                 "SELECT id FROM gc_plans"
                 " WHERE (state = 'executed' AND executed_at < ?)"
-                "    OR (state = 'pending' AND expires_at < ?)",
+                "    OR (state IN ('pending', 'executing') AND expires_at < ?)",
                 (executed_before, pending_before),
             ).fetchall()]
             if not ids:

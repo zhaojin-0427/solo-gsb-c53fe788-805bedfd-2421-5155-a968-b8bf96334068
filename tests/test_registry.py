@@ -1,6 +1,8 @@
 """端到端测试：上传/续传/去重、manifest CAS、GC dry-run 与并发安全。"""
 import hashlib
 import json
+import multiprocessing
+import sqlite3
 import threading
 import time
 
@@ -8,7 +10,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app.errors import OCIError
 from app.main import create_app
+from app.registry import Registry
 
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
@@ -603,6 +607,226 @@ def test_gc_plan_survives_restart_and_executes_once(settings):
     dup = c2.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
     assert dup.status_code == 409
     assert dup.json()["errors"][0]["code"] == "GC_PLAN_ALREADY_EXECUTED"
+
+
+# ---------------- GC 跨进程认领：同一 plan_id 只允许一个进程执行 ----------------
+
+def _gc_claim_worker(data_dir, plan_id, digest, mode, queue):
+    """子进程：独立 Registry + 独立 SQLite 连接，与父进程共享数据目录。"""
+    try:
+        settings = Settings(data_dir=data_dir, upload_lease_seconds=3600,
+                            gc_grace_seconds=3600)
+        registry = Registry(settings)
+
+        if mode == "slow":
+            # 在认领之后、任何复核/删除之前挂起：保证另一进程在其执行窗口内
+            # 竞争认领，且此刻候选尚未被触碰
+            orig_reachable = registry._reachable_sets
+
+            def _slow_reachable(*a, **k):
+                time.sleep(1.5)
+                return orig_reachable(*a, **k)
+
+            registry._reachable_sets = _slow_reachable
+
+        try:
+            registry.gc_execute(plan_id)
+            status, code = 200, None
+        except OCIError as exc:
+            status, code = exc.status_code, exc.code
+
+        # 竞争失败者必须确认自己没有碰任何候选（失败时候选依然存在）
+        blob_gone = registry.db.get_blob(digest) is None
+        queue.put({"mode": mode, "status": status, "code": code,
+                   "blob_gone": blob_gone})
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        queue.put({"mode": mode, "fatal": f"{exc!r}\n{traceback.format_exc()}"})
+
+
+def test_gc_same_plan_across_two_processes_only_one_deletes(settings):
+    """两个独立进程同时以 dry_run:false 和同一 plan_id 请求：只有认领成功的
+    进程删除；竞争失败进程收到 OCI 409 GC_PLAN_IN_PROGRESS 且不碰候选。"""
+    data_dir = str(settings.data_dir)
+    client = TestClient(create_app(settings))
+    d = push_blob(client, "app", b"cross process garbage")
+    registry = client.app.state.registry
+    with registry.lock:
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    plan_id = plan["plan_id"]
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+    client.app.state.registry.db._conn.commit()  # 确保计划已落盘
+
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+    slow = ctx.Process(target=_gc_claim_worker,
+                       args=(data_dir, plan_id, d, "slow", queue))
+    fast = ctx.Process(target=_gc_claim_worker,
+                       args=(data_dir, plan_id, d, "fast", queue))
+    slow.start()
+    time.sleep(0.4)  # 等慢进程完成原子认领进入 executing
+    fast.start()
+    results = []
+    for p in (fast, slow):
+        p.join(timeout=15)
+        assert not p.is_alive(), f"{p.name} timed out"
+        p.close()
+    while not queue.empty():
+        results.append(queue.get_nowait())
+
+    assert "fatal" not in results[0] and "fatal" not in results[1], results
+    by_mode = {r["mode"]: r for r in results}
+    winner, loser = by_mode["slow"], by_mode["fast"]
+    assert winner["status"] == 200, winner
+    assert winner["blob_gone"] is True                      # 只有赢家删除候选
+    assert loser["status"] == 409, loser
+    assert loser["code"] == "GC_PLAN_IN_PROGRESS", loser
+    assert loser["blob_gone"] is False                     # 输家不碰任何候选
+
+    # 赢家完成后，落后的旧重试变成 GC_PLAN_ALREADY_EXECUTED
+    done = TestClient(create_app(settings))
+    dup = done.post("/gc", json={"dry_run": False, "plan_id": plan_id})
+    assert dup.status_code == 409
+    assert dup.json()["errors"][0]["code"] == "GC_PLAN_ALREADY_EXECUTED"
+    assert done.get(f"/v2/app/blobs/{d}").status_code == 404
+
+    # 旧计划不能再用；剩余候选（如果有）只能走新的 dry-run
+    fresh_garbage = push_blob(done, "app", b"leftover after race")
+    with done.app.state.registry.lock:
+        done.app.state.registry.db._conn.execute(
+            "UPDATE blobs SET created_at = 0")
+        done.app.state.registry.db._conn.commit()
+    next_plan = done.post("/gc", json={"dry_run": True,
+                                      "grace_seconds": 0}).json()
+    assert fresh_garbage in {b["digest"]
+                             for b in next_plan["delete"]["blobs"]}
+
+
+def test_gc_crash_after_claim_leaves_non_replayable_executing_plan(
+        client, settings, monkeypatch):
+    """认领成功后、删除过程中崩溃：计划停留在 executing，重试返回 409
+    GC_PLAN_IN_PROGRESS（不重放）；部分删除生效，剩余候选重新 dry-run 审阅。"""
+    registry = client.app.state.registry
+
+    # 一个过期上传 + 一个垃圾 blob；让删除在上传删除后、blob 删除前崩溃
+    stale = client.post("/v2/app/blobs/uploads").headers["Docker-Upload-UUID"]
+    garbage = push_blob(client, "app", b"partially executed garbage")
+    with registry.lock:
+        registry.db.update_upload_progress(stale, 0, time.time() - 1)
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert stale in {u["id"] for u in plan["delete"]["uploads"]}
+    assert garbage in {b["digest"] for b in plan["delete"]["blobs"]}
+
+    real_delete_manifests = registry.db.delete_manifests
+
+    def _crash_then_restore(keys):
+        # 上传已删（部分删除生效）；在 manifest 删除边界模拟进程崩溃，
+        # 此后的 blob 一个都不能动
+        registry.db.delete_manifests = real_delete_manifests
+        raise RuntimeError("simulated crash mid-GC")
+
+    monkeypatch.setattr(registry.db, "delete_manifests", _crash_then_restore)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        registry.gc_execute(plan["plan_id"])
+
+    # 计划保留在 executing（不可重放的执行中状态），认领信息已落盘
+    row = registry.db.get_gc_plan(plan["plan_id"])
+    assert row["state"] == "executing"
+    assert row["claimed_at"] is not None
+    assert row["claimer"]
+    assert row["executed_at"] is None
+
+    # 崩溃前已完成的删除（上传）保留，未执行到的 blob 仍在
+    assert registry.db.get_upload(stale) is None
+    assert client.get(f"/v2/app/blobs/{garbage}").status_code == 200
+
+    # 同一计划重试（即使跨进程的新实例）：409 GC_PLAN_IN_PROGRESS，不碰候选
+    retry = client.post("/gc", json={"dry_run": False,
+                                     "plan_id": plan["plan_id"]})
+    assert retry.status_code == 409
+    err = retry.json()["errors"][0]
+    assert err["code"] == "GC_PLAN_IN_PROGRESS"
+    assert err["detail"]["stale"] is False  # 刚认领，不算僵死
+    assert client.get(f"/v2/app/blobs/{garbage}").status_code == 200
+
+    other = TestClient(create_app(settings))
+    retry2 = other.post("/gc", json={"dry_run": False,
+                                     "plan_id": plan["plan_id"]})
+    assert retry2.status_code == 409
+    assert retry2.json()["errors"][0]["code"] == "GC_PLAN_IN_PROGRESS"
+    assert other.get(f"/v2/app/blobs/{garbage}").status_code == 200
+
+    # 旧计划不可重放；剩余候选可重新 dry-run 审阅并由新计划回收
+    next_plan = other.post("/gc", json={"dry_run": True,
+                                        "grace_seconds": 0}).json()
+    assert garbage in {b["digest"] for b in next_plan["delete"]["blobs"]}
+    r = other.post("/gc", json={"dry_run": False,
+                                "plan_id": next_plan["plan_id"]})
+    assert r.status_code == 200
+    assert other.get(f"/v2/app/blobs/{garbage}").status_code == 404
+
+    # 旧计划仍是 executing 且再试仍是 409
+    assert registry.db.get_gc_plan(plan["plan_id"])["state"] == "executing"
+    assert other.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).status_code == 409
+
+
+def test_gc_stale_executing_plan_reports_stale_hint(client):
+    """认领后长期未完成（进程早已崩溃）：重试 409，detail.stale=true。"""
+    registry = client.app.state.registry
+    garbage = push_blob(client, "app", b"zombie plan garbage")
+    with registry.lock:
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    with registry.lock:
+        registry.db._conn.execute(
+            "UPDATE gc_plans SET state = 'executing', claimed_at = ?,"
+            " claimer = 'dead-host:1:deadbeef' WHERE id = ?",
+            (time.time() - registry.CLAIM_STALE_SECONDS - 10, plan["plan_id"]),
+        )
+        registry.db._conn.commit()
+
+    r = client.post("/gc", json={"dry_run": False,
+                                 "plan_id": plan["plan_id"]})
+    assert r.status_code == 409
+    err = r.json()["errors"][0]
+    assert err["code"] == "GC_PLAN_IN_PROGRESS"
+    assert err["detail"]["stale"] is True
+    assert "crashed" in err["message"]
+    assert client.get(f"/v2/app/blobs/{garbage}").status_code == 200
+
+
+def test_gc_plan_schema_migrates_from_two_state_layout(tmp_path):
+    """旧版本数据库（gc_plans 只有 pending/executed 两列）可平滑升级。"""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(data_dir / "registry.db"))
+    conn.executescript(
+        """
+        CREATE TABLE gc_plans (
+            id TEXT PRIMARY KEY, state TEXT NOT NULL, grace_seconds INTEGER NOT NULL,
+            created_at REAL NOT NULL, expires_at REAL NOT NULL, executed_at REAL
+        );
+        """
+    )
+    conn.execute("INSERT INTO gc_plans VALUES ('oldplan', 'pending', 0, 0, 9.9e18, NULL)")
+    conn.commit()
+    conn.close()
+
+    registry = Registry(Settings(data_dir=data_dir))
+    row = registry.db.get_gc_plan("oldplan")
+    assert row["state"] == "pending"
+    assert row["claimed_at"] is None and row["claimer"] is None
+    # 旧 pending 计划仍能被原子认领
+    assert registry.db.claim_gc_plan("oldplan", 1.0, "h:1:x") == "claimed"
+    assert registry.db.get_gc_plan("oldplan")["state"] == "executing"
 
 
 # ---------------- 重启恢复 ----------------

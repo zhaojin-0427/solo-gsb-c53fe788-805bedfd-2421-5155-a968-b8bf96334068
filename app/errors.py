@@ -130,3 +130,31 @@ def gc_plan_already_executed(plan_id: str, executed_at: "str | None") -> OCIErro
         "repeated execution deletes nothing, run a new dry-run for a new plan",
         {"plan_id": plan_id, "executed_at": executed_at},
     )
+
+
+def gc_plan_in_progress(plan_id: str, claimed_at: "str | None",
+                        claimer: "str | None", stale: bool = False) -> OCIError:
+    """认领失败（409）：另一进程正在执行，或上次执行在认领后崩溃。
+
+    两种情况都不允许重放：计划已脱离 pending，本请求不触碰任何候选；
+    剩余候选可重新 dry-run 生成新计划审阅。
+    """
+    if stale:
+        message = (
+            f"GC plan {plan_id!r} was claimed at {claimed_at or '<unknown>'} by "
+            f"{claimer or '<unknown>'} but never finished (the executing process "
+            "crashed or was killed); it cannot be replayed and no candidates were "
+            "touched by this request, run a new dry-run for a new plan"
+        )
+    else:
+        message = (
+            f"GC plan {plan_id!r} is already being executed by another process "
+            f"(claimed at {claimed_at or '<unknown>'} by {claimer or '<unknown>'}); "
+            "concurrent execution of the same plan is rejected and no candidates "
+            "were touched by this request, retry later or run a new dry-run"
+        )
+    return OCIError(
+        409, "GC_PLAN_IN_PROGRESS", message,
+        {"plan_id": plan_id, "claimed_at": claimed_at, "claimer": claimer,
+         "stale": stale},
+    )

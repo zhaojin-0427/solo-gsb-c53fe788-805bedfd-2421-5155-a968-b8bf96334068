@@ -15,7 +15,7 @@
 | 重启恢复 | 上传会话与进度持久化在 SQLite，重启后自动对齐磁盘实际进度，可继续续传 |
 | 不可变 manifest | digest 寻址的 manifest 内容与摘要不符即拒绝；发布时校验 config/layers/subject/子 manifest 引用必须已存在，杜绝悬空引用 |
 | 标签 CAS | 移动已存在的标签必须携带期望摘要（`If-Match` 头或 `?expected=`），不匹配返回 `409 TAG_CONFLICT` |
-| 安全 GC | 以「标签 + 未过期上传租约」为根建立可达图；**先 dry-run 生成持久化复核计划（`plan_id`，1 小时有效、重启有效），再凭 `plan_id` 执行**；执行时重算可达性/租约，只删计划内仍符合条件的对象，复核窗口内新产生的候选不会被误删；与并发拉取/发布互斥 |
+| 安全 GC | 以「标签 + 未过期上传租约」为根建立可达图；**先 dry-run 生成持久化复核计划（`plan_id`，1 小时有效、重启有效），再凭 `plan_id` 执行**；执行前在 SQLite 中原子认领计划（`pending → executing`），多个进程共享同一数据目录并发执行同一计划时只有一个进程认领成功并删除，竞争方返回 `409 GC_PLAN_IN_PROGRESS` 且不碰候选；认领后进程崩溃则计划永久停留在 `executing`（不可重放），全部删除完成才标记 `executed`；执行时重算可达性/租约，只删计划内仍符合条件的对象，复核窗口内新产生的候选不会被误删；与并发拉取/发布互斥 |
 
 ## 快速开始（Docker Compose 一键启动）
 
@@ -60,7 +60,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 5000
 | PUT | `/v2/{repo}/manifests/{ref}` | 发布 manifest；`ref` 为标签时需 CAS（`If-Match` 或 `?expected=`） |
 | GET/HEAD | `/v2/{repo}/manifests/{ref}` | 拉取 manifest（`ref` 可为标签或 digest） |
 | GET | `/v2/{repo}/tags/list` | 列出标签 |
-| POST | `/gc` | 垃圾回收。`{"dry_run": true, "grace_seconds": 3600}` 生成持久化复核计划并返回 `plan_id`；`{"dry_run": false, "plan_id": "..."}` 凭计划执行 |
+| POST | `/gc` | 垃圾回收。`{"dry_run": true, "grace_seconds": 3600}` 生成持久化复核计划并返回 `plan_id`；`{"dry_run": false, "plan_id": "..."}` 先原子认领计划（跨进程互斥），成功才执行；竞争返回 `409 GC_PLAN_IN_PROGRESS` |
 
 错误统一为 OCI 格式：`{"errors":[{"code","message","detail"}]}`。
 
@@ -150,14 +150,29 @@ curl -s http://localhost:5000/v2/demo/app/blobs/$DIGEST -o layer.bin
 curl -s http://localhost:5000/v2/demo/app/tags/list
 ```
 
-### 4. 垃圾回收（dry-run 复核计划 → 凭 plan_id 执行）
+### 4. 垃圾回收（dry-run 复核计划 → 原子认领 → 凭 plan_id 执行）
 
 GC 采用**两阶段复核**，修复了「dry-run 后标签移动产生新垃圾、执行时被一并
-删除」的竞态：dry-run 把候选清单**快照持久化**成计划（`plan_id`），执行时只
-处理计划内、且此刻仍符合条件的对象；复核窗口内新出现的候选一律留给下次审阅。
+删除」以及「两个进程同时执行同一计划、各自读取 pending 并重复删除」两类
+竞态：
+
+1. dry-run 把候选清单**快照持久化**成计划（`plan_id`，状态 `pending`），
+   执行时只处理计划内、且此刻仍符合条件的对象；复核窗口内新出现的候选一律
+   留给下次审阅。
+2. 执行（`dry_run:false`）**先在 SQLite 中原子认领**：单条写事务把计划
+   从 `pending` 更新为 `executing` 并立即提交（`UPDATE ... WHERE
+   state='pending' AND expires_at>now`）。多个进程挂载同一数据目录并发请求
+   同一 `plan_id` 时，只有一个进程认领成功；其余进程收到
+   `409 GC_PLAN_IN_PROGRESS`，**不复核、不删除任何候选**。
+3. 认领成功的进程再重算可达性与租约、只删计划内仍符合条件的对象，
+   **全部删除完成后**才把计划标记为 `executed`。
 
 > 计划保存在 SQLite 中，**进程重启后依然有效**；生成后 **1 小时**内可执行；
-> 一份计划**只能执行一次**，重复执行返回 `409` 且不再删数据。
+> 一份计划**只能执行一次**。认领成功后若执行进程异常或崩溃，计划停留在
+> **`executing`（不可重放的执行中状态）**——已删除的部分不会重复执行，
+> 对同一 `plan_id` 的重试同样返回 `409 GC_PLAN_IN_PROGRESS`（detail 中
+> `stale:true` 表示认领方疑似已崩溃），剩余候选请重新 dry-run 审阅后用新
+> 计划回收。
 
 #### 第一步：dry-run 生成计划（不删任何数据）
 
@@ -173,45 +188,45 @@ curl -s -X POST -H 'Content-Type: application/json' \
 {
   "dry_run": true,
   "executed": false,
-  "plan_id": "8c127c6eacfc43e99e61c00fb65eafff",
+  "plan_id": "7d4ff3878fc848959fef26bdf39e3cce",
   "grace_seconds": 0,
-  "generated_at": "2026-10-02T02:07:03.770712+00:00",
-  "expires_at": "2026-10-02T03:07:03.770712+00:00",
+  "generated_at": "2026-10-03T02:24:31.973878+00:00",
+  "expires_at": "2026-10-03T03:24:31.973878+00:00",
   "summary": {
     "blobs_to_delete": 2,
     "manifests_to_delete": 1,
     "uploads_to_delete": 1,
-    "bytes_to_reclaim": 21,
-    "manifests_reachable": 1,
-    "blobs_reachable": 2,
+    "bytes_to_reclaim": 30,
+    "manifests_reachable": 2,
+    "blobs_reachable": 3,
     "blobs_kept_by_grace": 0,
     "uploads_kept_by_lease": 1
   },
   "delete": {
     "blobs": [
-      {"digest": "sha256:165f83583dbdfe9eae2121e5ac9d56638daa6730509308f9c355762e893177f4",
-       "size": 7, "repos": ["demo/app"],
+      {"digest": "sha256:492fa4fc2ff764ecd108c3c4fbabd4ff6561a17d8feacfcf100b9f3da05a349c",
+       "size": 17, "repos": ["demo/app"],
        "reason": "unreferenced and older than grace period"},
-      {"digest": "sha256:97de4a6c1d6a83826325596ca29cc454f5b8c87bb1d5ea60c6ca2d15ab9dec92",
-       "size": 14, "repos": ["demo/app"],
+      {"digest": "sha256:9e41582b7b5eced4b02b2f9112ce85ceef30b92cf2b3fb4c92f10061b3400c0b",
+       "size": 13, "repos": ["demo/app"],
        "reason": "unreferenced and older than grace period"}
     ],
     "manifests": [
       {"repo": "demo/app",
-       "digest": "sha256:eb42747048bf86fd2e571093614525963ef737e7d35e2d8cb20bba6586857225",
+       "digest": "sha256:28931bb7077f5cb2d2083be81dcb42725febe13ff28a40ae7bc7c461056900e6",
        "media_type": "application/vnd.oci.image.manifest.v1+json",
        "reason": "untagged"}
     ],
     "uploads": [
-      {"id": "660ab73e99684f49999203878365fa3b", "repo": "demo/app", "size": 0,
-       "expired_at": "1970-01-01T00:00:01+00:00", "reason": "lease expired"}
+      {"id": "3601015371a64bc7a702fab2d965a8f1", "repo": "demo/app", "size": 0,
+       "expired_at": "2026-10-03T02:23:37.960170+00:00", "reason": "lease expired"}
     ]
   },
   "keep": {
     "blobs_grace_protected": [],
     "uploads_leased": [
-      {"id": "dc4704cef321442e8180a9b24d86aafd", "repo": "demo/app", "size": 0,
-       "expires_at": "2026-10-02T03:06:45.215453+00:00"}
+      {"id": "95473834eb4d4fe5ad4a28c3cf79ac2e", "repo": "demo/app", "size": 0,
+       "expires_at": "2026-10-03T03:24:31.957696+00:00"}
     ]
   }
 }
@@ -224,21 +239,21 @@ curl -s -X POST -H 'Content-Type: application/json' \
 
 ```bash
 curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"dry_run": false, "plan_id": "8c127c6eacfc43e99e61c00fb65eafff"}' \
+  -d '{"dry_run": false, "plan_id": "7d4ff3878fc848959fef26bdf39e3cce"}' \
   http://localhost:5000/gc
 ```
 
-实际响应——`deleted` 是真正删除的项，`skipped` 是计划内、但执行时已重新可达/
-续租/消失而跳过的项：
+服务端先原子认领该计划（认领成功后再复核、删除）。实际响应——`deleted` 是
+真正删除的项，`skipped` 是计划内、但执行时已重新可达/续租/消失而跳过的项：
 
 ```json
 {
   "dry_run": false,
   "executed": true,
-  "plan_id": "8c127c6eacfc43e99e61c00fb65eafff",
+  "plan_id": "7d4ff3878fc848959fef26bdf39e3cce",
   "grace_seconds": 0,
-  "generated_at": "2026-10-02T02:07:03.770712+00:00",
-  "executed_at": "2026-10-02T02:07:25.296842+00:00",
+  "generated_at": "2026-10-03T02:24:31.973878+00:00",
+  "executed_at": "2026-10-03T02:25:01.028073+00:00",
   "summary": {
     "blobs_deleted": 2,
     "manifests_deleted": 1,
@@ -246,23 +261,23 @@ curl -s -X POST -H 'Content-Type: application/json' \
     "blobs_skipped": 0,
     "manifests_skipped": 0,
     "uploads_skipped": 0,
-    "bytes_reclaimed": 21
+    "bytes_reclaimed": 30
   },
   "deleted": {
     "blobs": [
-      {"digest": "sha256:165f83583dbdfe9eae2121e5ac9d56638daa6730509308f9c355762e893177f4",
-       "size": 7, "repos": ["demo/app"], "reason": "still unreferenced at execution"},
-      {"digest": "sha256:97de4a6c1d6a83826325596ca29cc454f5b8c87bb1d5ea60c6ca2d15ab9dec92",
-       "size": 14, "repos": ["demo/app"], "reason": "still unreferenced at execution"}
+      {"digest": "sha256:492fa4fc2ff764ecd108c3c4fbabd4ff6561a17d8feacfcf100b9f3da05a349c",
+       "size": 17, "repos": ["demo/app"], "reason": "still unreferenced at execution"},
+      {"digest": "sha256:9e41582b7b5eced4b02b2f9112ce85ceef30b92cf2b3fb4c92f10061b3400c0b",
+       "size": 13, "repos": ["demo/app"], "reason": "still unreferenced at execution"}
     ],
     "manifests": [
       {"repo": "demo/app",
-       "digest": "sha256:eb42747048bf86fd2e571093614525963ef737e7d35e2d8cb20bba6586857225",
+       "digest": "sha256:28931bb7077f5cb2d2083be81dcb42725febe13ff28a40ae7bc7c461056900e6",
        "media_type": "application/vnd.oci.image.manifest.v1+json",
        "reason": "still untagged at execution"}
     ],
     "uploads": [
-      {"id": "660ab73e99684f49999203878365fa3b", "repo": "demo/app", "size": 0,
+      {"id": "3601015371a64bc7a702fab2d965a8f1", "repo": "demo/app", "size": 0,
        "reason": "lease still expired at execution"}
     ]
   },
@@ -294,27 +309,100 @@ curl -s -X POST -H 'Content-Type: application/json' \
 | 未带 `plan_id` / 空白 | 400 | `GC_PLAN_REQUIRED` |
 | `plan_id` 未知 | 404 | `GC_PLAN_UNKNOWN` |
 | 计划生成已超过 1 小时 | 410 | `GC_PLAN_EXPIRED` |
-| 计划已经执行过 | 409 | `GC_PLAN_ALREADY_EXECUTED` |
+| 计划已经执行过（旧计划重试） | 409 | `GC_PLAN_ALREADY_EXECUTED` |
+| 计划已被另一进程认领、正在执行；或认领后执行方崩溃留下不可重放的 `executing` 计划 | 409 | `GC_PLAN_IN_PROGRESS` |
 
-实测示例：
+实测请求与响应：
 
 ```bash
 $ curl -s -X POST -H 'Content-Type: application/json' \
     -d '{"dry_run": false}' http://localhost:5000/gc
 # HTTP 400
 {"errors":[{"code":"GC_PLAN_REQUIRED",
-  "message":"execution (dry_run=false) requires the plan_id of a prior dry-run report; ...",
+  "message":"execution (dry_run=false) requires the plan_id of a prior dry-run report; run a dry-run first and re-submit the returned plan_id",
   "detail":{"hint":"POST /gc with {\"dry_run\": true} to obtain a plan_id"}}]}
 
 $ curl -s -X POST -H 'Content-Type: application/json' \
     -d '{"dry_run": false, "plan_id": "does-not-exist"}' http://localhost:5000/gc
-# HTTP 404 -> GC_PLAN_UNKNOWN
+# HTTP 404
+{"errors":[{"code":"GC_PLAN_UNKNOWN",
+  "message":"unknown GC plan_id: 'does-not-exist'; run a new dry-run",
+  "detail":{"plan_id":"does-not-exist"}}]}
 
 $ curl -s -X POST -H 'Content-Type: application/json' \
-    -d '{"dry_run": false, "plan_id": "8c127c6e..."}' http://localhost:5000/gc
-# HTTP 410 -> GC_PLAN_EXPIRED（超过生成后 1 小时）
-# HTTP 409 -> GC_PLAN_ALREADY_EXECUTED（重复执行）
+    -d '{"dry_run": false, "plan_id": "32507fa25c9747df9bb8b53c7b6693b6"}' http://localhost:5000/gc
+# HTTP 410（计划超过生成后 1 小时）
+{"errors":[{"code":"GC_PLAN_EXPIRED",
+  "message":"GC plan '32507fa25c9747df9bb8b53c7b6693b6' expired at 2026-10-03T02:25:42.964437+00:00 (plans are valid for one hour after generation); run a new dry-run",
+  "detail":{"plan_id":"32507fa25c9747df9bb8b53c7b6693b6",
+            "expires_at":"2026-10-03T02:25:42.964437+00:00"}}]}
+
+$ curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"dry_run": false, "plan_id": "7d4ff3878fc848959fef26bdf39e3cce"}' http://localhost:5000/gc
+# HTTP 409（旧计划重试：计划已经执行过）
+{"errors":[{"code":"GC_PLAN_ALREADY_EXECUTED",
+  "message":"GC plan '7d4ff3878fc848959fef26bdf39e3cce' was already executed at 2026-10-03T02:25:01.028073+00:00; repeated execution deletes nothing, run a new dry-run for a new plan",
+  "detail":{"plan_id":"7d4ff3878fc848959fef26bdf39e3cce",
+            "executed_at":"2026-10-03T02:25:01.028073+00:00"}}]}
 ```
+
+并发竞争失败（另一进程认领成功、正在执行）时的实际 409 响应——本请求没有
+复核也没有触碰任何候选：
+
+```bash
+$ curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"dry_run": false, "plan_id": "071462689fce42529d3b4464801ad1a5"}' \
+    http://localhost:5000/gc
+# HTTP 409
+{"errors":[{"code":"GC_PLAN_IN_PROGRESS",
+  "message":"GC plan '071462689fce42529d3b4464801ad1a5' is already being executed by another process (claimed at 2026-10-03T02:26:05.298377+00:00 by registry-2:1042:9f31a2bc); concurrent execution of the same plan is rejected and no candidates were touched by this request, retry later or run a new dry-run",
+  "detail":{"plan_id":"071462689fce42529d3b4464801ad1a5",
+            "claimed_at":"2026-10-03T02:26:05.298377+00:00",
+            "claimer":"registry-2:1042:9f31a2bc",
+            "stale":false}}]}
+```
+
+若认领成功的进程随后崩溃、计划长时间停留在 `executing`（超过 5 分钟），重试
+得到同样的 409，但 `detail.stale` 为 `true`、消息提示认领方已崩溃：
+
+```json
+{"errors":[{"code":"GC_PLAN_IN_PROGRESS",
+  "message":"GC plan '...' was claimed at ... by dead-host:1:deadbeef but never finished (the executing process crashed or was killed); it cannot be replayed and no candidates were touched by this request, run a new dry-run for a new plan",
+  "detail":{"plan_id":"...", "claimed_at":"...", "claimer":"dead-host:1:deadbeef",
+            "stale":true}}]}
+```
+
+#### 跨进程并发实测：同一 plan_id 只有一个进程删除
+
+启动两个独立进程、挂载**同一个数据目录**（相当于两个容器共用同一卷），对
+同一个 `plan_id` 同时发起 20 个执行请求（每个进程 10 个）：
+
+```bash
+REGISTRY_DATA_DIR=/data uvicorn app.main:app --port 8000 &   # 进程 A
+REGISTRY_DATA_DIR=/data uvicorn app.main:app --port 8001 &   # 进程 B
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' \
+    -d '{"dry_run": false, "plan_id": "ea2789edc5934436b3fb00e792d443e7"}' :8000/gc &
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' \
+    -d '{"dry_run": false, "plan_id": "ea2789edc5934436b3fb00e792d443e7"}' :8001/gc &
+done; wait
+```
+
+实际结果：**恰好 1 个 `200`，其余 19 个全部 `409`**——执行窗口内竞争失败的
+是 `GC_PLAN_IN_PROGRESS`，赢家完成后到达的是 `GC_PLAN_ALREADY_EXECUTED`；
+计划内的候选只被删除一次：
+
+```text
+      1 200
+     19 409
+
+1 200-ok
+9 GC_PLAN_ALREADY_EXECUTED
+10 GC_PLAN_IN_PROGRESS
+```
+
+认领后执行进程崩溃的语义同理：计划保持 `executing`，不会有第二个进程重放它；
+尚未删除的候选依然完好，重新 dry-run 后可以用**新计划**审阅、回收。
 
 #### 复核窗口内新产生的候选不会被误删
 
@@ -339,7 +427,17 @@ GC 语义：
 - **两阶段复核**：dry-run 快照候选为持久化计划（`gc_plans` 等表），执行必须凭
   `plan_id`；计划缺失/未知/超过 1 小时/已执行一律拒绝，不删任何数据；计划跨
   重启有效，且只能执行一次。
-- **执行时复核（TOCTOU 防护）**：在同一把进程锁内，以**计划记录的宽限期**重新
+- **跨进程原子认领**：执行的第一步是在 SQLite 写事务内
+  `UPDATE gc_plans SET state='executing' WHERE id=? AND state='pending'
+  AND expires_at>?` 并立即提交。WAL + `busy_timeout` 保证跨进程写串行，因此
+  两个进程同时执行同一计划时只有一个 `rowcount==1` 的赢家；输家收到
+  409 `GC_PLAN_IN_PROGRESS`，不读取候选、不做删除。进程内 RLock 只负责同进程
+  内与发布/上传互斥，跨进程安全不依赖它。
+- **认领即不可重放**：认领提交后若执行方异常或崩溃，计划永久停留在
+  `executing`（`claimed_at`/`claimer` 记录认领时刻与 `host:pid` 实例）。重试
+  同一 `plan_id` 一律 409，已删部分不会重复执行；剩余候选重新 dry-run 后用
+  新计划审阅、回收。全部删除成功提交后状态才变为 `executed`。
+- **执行时复核（TOCTOU 防护）**：认领成功后以**计划记录的宽限期**重新
   计算可达图与上传租约——计划内且仍不可达/仍超宽限/租约仍过期的才删除；
   重新可达、续租或已不存在的进入 `skipped`。
 - **计划外不碰**：dry-run 之后因标签移动、删除、悬空推送新产生的候选不在计划内，
@@ -357,14 +455,14 @@ GC 语义：
 
 ```
 app/
-  main.py       # FastAPI 路由（/v2/*、/gc 两阶段复核）
-  registry.py   # 核心逻辑：上传、manifest CAS、GC 可达图与复核计划执行
-  db.py         # SQLite 元数据（WAL，进程内 RLock 串行化；含 gc_plans 持久化计划）
+  main.py       # FastAPI 路由（/v2/*、/gc 两阶段复核与跨进程原子认领）
+  registry.py   # 核心逻辑：上传、manifest CAS、GC 可达图与计划原子认领/复核执行
+  db.py         # SQLite 元数据（WAL + busy_timeout；gc_plans 支持 pending/executing/executed 三态原子认领）
   storage.py    # 本地文件存储：blobs/sha256/<hex> 内容寻址 + uploads/<uuid>
   digest.py     # digest/tag/repo 校验与 sha256 计算
-  errors.py     # OCI 错误模型（含 GC_PLAN_*）
+  errors.py     # OCI 错误模型（含 GC_PLAN_*，认领失败为 GC_PLAN_IN_PROGRESS 409）
   config.py     # 环境变量配置
-tests/test_registry.py   # 29 个端到端测试
+tests/test_registry.py   # 33 个端到端测试
 Dockerfile / docker-compose.yml
 ```
 
@@ -379,12 +477,19 @@ pytest tests/ -q
 manifest 引用校验、digest 不可变性、标签 CAS 冲突、GC dry-run/执行、
 宽限期与租约保护、GC 与并发拉取/发布竞争、重启后恢复上传，以及 GC 复核计划：
 dry-run 后新增候选不被误删、重新可达/续租跳过、计划缺失/未知/过期(410)/已执行
-(409)拒绝、计划跨重启有效且只能执行一次。
+(409)拒绝、计划跨重启有效且只能执行一次；**新增：两个独立进程（各自的连接、锁
+与 Registry 实例，fork 子进程）同时执行同一 `plan_id` 时恰好一个成功删除、竞争
+方 409 `GC_PLAN_IN_PROGRESS` 且不碰候选；认领后模拟崩溃，计划保留为不可重放的
+`executing`、重试 409、剩余候选可重新 dry-run 回收；长期未完成的僵死计划
+`stale:true` 提示；旧两态（pending/executed）数据库平滑迁移**。
 
 ## 设计说明与限制
 
-- **单进程单写**：SQLite（WAL）+ 进程内写锁保证元数据一致；请用单 worker
-  运行（compose 默认如此）。多实例水平扩展需替换为外部数据库与共享存储。
+- **共享数据目录与多进程**：SQLite 以 WAL 打开并设置 15s `busy_timeout`，
+  多个进程可以挂载同一个数据目录（例如同一卷上的两个容器、滚动升级时的新旧
+  实例并存）。GC 执行通过 `gc_plans` 的原子状态认领跨进程互斥，同一计划只会
+  被一个进程执行；其它元数据写事务由 SQLite 自身的写锁串行化。compose 默认
+  仍以单实例运行；水平扩展到多节点仍需替换为外部数据库与共享存储。
 - **命名空间隔离**：blob 物理上全局去重，但 `GET /v2/<repo>/blobs/<digest>`
   要求该 blob 已在 `<repo>` 命名空间内关联，跨仓库不可直接读。
 - **manifest 不可变**：同一 digest 的内容恒定；digest 寻址的 PUT 会校验内容
