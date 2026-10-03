@@ -1,7 +1,9 @@
 """SQLite 元数据层。
 
-单进程内所有连接访问都通过一把 RLock 串行化；SQLite 开启 WAL，
-写事务由 `with conn:` 保证提交/回滚。表设计：
+单进程内所有连接访问都通过一把 RLock 串行化；SQLite 开启 WAL 并设置
+busy_timeout，写事务由 `with conn:` 保证提交/回滚。GC 计划的执行认领是
+一条条件 UPDATE（pending -> executing），依靠 SQLite 的写串行化实现跨
+进程互斥：多个进程共享同一数据目录时也只有一个能认领成功。表设计：
 
 - blobs       全局内容寻址 blob（按摘要去重）
 - repo_blobs  repo -> blob 的命名空间关联（同一 blob 可被多个 repo 可见）
@@ -59,11 +61,13 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 CREATE TABLE IF NOT EXISTS gc_plans (
     id           TEXT PRIMARY KEY,
-    state        TEXT NOT NULL,          -- pending | executed
+    state        TEXT NOT NULL,          -- pending | executing | executed
     grace_seconds INTEGER NOT NULL,      -- 生成时记录，执行复核以此为准
     created_at   REAL NOT NULL,
     expires_at   REAL NOT NULL,          -- created_at + 1h，过期计划拒绝执行
-    executed_at  REAL
+    executed_at  REAL,
+    claimed_at   REAL,                   -- 认领（进入 executing）的时间
+    claimed_by   TEXT                    -- 认领者标识（pid@host），仅诊断用
 );
 CREATE TABLE IF NOT EXISTS gc_plan_blobs (
     plan_id    TEXT NOT NULL,
@@ -92,11 +96,23 @@ class Database:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self._conn = sqlite3.connect(str(path), check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=10000")
             self._conn.executescript(SCHEMA)
+            self._migrate_gc_plans()
+
+    def _migrate_gc_plans(self):
+        """旧库的 gc_plans 缺少认领列（state 也只有 pending/executed），原地补齐。"""
+        cols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(gc_plans)"
+        ).fetchall()}
+        if cols and "claimed_at" not in cols:
+            self._conn.execute("ALTER TABLE gc_plans ADD COLUMN claimed_at REAL")
+        if cols and "claimed_by" not in cols:
+            self._conn.execute("ALTER TABLE gc_plans ADD COLUMN claimed_by TEXT")
 
     # ---------------- uploads ----------------
 
@@ -352,15 +368,55 @@ class Database:
             ).fetchall()
             return [r["upload_id"] for r in rows]
 
-    def mark_gc_plan_executed(self, plan_id: str, now: float):
+    def claim_gc_plan(self, plan_id: str, now: float, owner: str) -> "tuple[str, dict | None]":
+        """原子认领一份待执行计划：pending 且未过期 -> executing，立即提交。
+
+        依靠 SQLite 写事务的行级条件更新在**跨进程**间互斥：同一计划的并发
+        执行请求里，条件 UPDATE 最多只有一个进程命中（rowcount==1）。认领
+        独立成事务并立刻提交，因此之后即使认领者崩溃，executing 状态也已
+        持久化、不可重放。
+
+        返回 (status, plan)：
+          claimed, plan   认领成功，plan 为含 grace/时间戳的计划行
+          expired, None   计划存在但 pending 已过期（保留 410 语义）
+          unavailable,None 不存在 pending 可认领记录（未知/executing/executed）
+        """
         with self._lock, self._conn:
-            self._conn.execute(
-                "UPDATE gc_plans SET state = 'executed', executed_at = ? WHERE id = ?",
+            row = self._conn.execute(
+                "SELECT id, state, expires_at FROM gc_plans WHERE id = ?",
+                (plan_id,),
+            ).fetchone()
+            if row is None:
+                return "unavailable", None
+            cur = self._conn.execute(
+                "UPDATE gc_plans"
+                " SET state = 'executing', claimed_at = ?, claimed_by = ?"
+                " WHERE id = ? AND state = 'pending' AND expires_at > ?",
+                (now, owner, plan_id, now),
+            )
+            if cur.rowcount == 1:
+                plan = self.get_gc_plan(plan_id)
+                return "claimed", plan
+            if row["state"] == "pending" and row["expires_at"] <= now:
+                return "expired", None
+            return "unavailable", None
+
+    def mark_gc_plan_executed(self, plan_id: str, now: float) -> bool:
+        """认领成功者在删除完成后把计划标记为 executed；返回是否完成翻转。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE gc_plans SET state = 'executed', executed_at = ?"
+                " WHERE id = ? AND state = 'executing'",
                 (now, plan_id),
             )
+            return cur.rowcount == 1
 
     def prune_gc_plans(self, executed_before: float, pending_before: float):
-        """删除历史计划（已执行且超过保留期，或早已过期仍未执行），防止表无限增长。"""
+        """删除历史计划（已执行且超过保留期，或早已过期仍未执行），防止表无限增长。
+
+        executing 状态的计划绝不清理——它可能正被某个进程执行，或由崩溃留下
+        等待人工/新 dry-run 处理，不能被 prune 抹掉。
+        """
         with self._lock, self._conn:
             ids = [r["id"] for r in self._conn.execute(
                 "SELECT id FROM gc_plans"

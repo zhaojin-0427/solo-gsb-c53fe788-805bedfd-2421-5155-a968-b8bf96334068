@@ -130,3 +130,17 @@ def gc_plan_already_executed(plan_id: str, executed_at: "str | None") -> OCIErro
         "repeated execution deletes nothing, run a new dry-run for a new plan",
         {"plan_id": plan_id, "executed_at": executed_at},
     )
+
+
+def gc_plan_in_progress(plan_id: str, claimed_at: "str | None",
+                        claimed_by: "str | None") -> OCIError:
+    """同一份计划已被另一个执行者认领（跨进程竞争失败，或认领者已崩溃）。"""
+    return OCIError(
+        409, "GC_PLAN_IN_PROGRESS",
+        f"GC plan {plan_id!r} is already being executed by another worker"
+        f" ({claimed_by or 'unknown'}) since {claimed_at or '<unknown>'}; the plan"
+        " cannot be executed twice, and the losing request deletes nothing."
+        " If that worker crashed, the plan stays in progress on purpose: run a"
+        " new dry-run to review the remaining candidates",
+        {"plan_id": plan_id, "claimed_at": claimed_at, "claimed_by": claimed_by},
+    )

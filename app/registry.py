@@ -3,11 +3,17 @@
 并发模型：进程内一把 threading.RLock 串行化所有元数据写事务与 GC；
 拉取 blob 时在锁内打开文件句柄，锁外流式发送——即使 GC 随后删除文件，
 POSIX 下已打开的 fd 依然可读，因此并发拉取不会被误删打断。
+
+GC 执行还需要跨进程互斥（多个进程可共享同一数据目录）：execute 先在
+SQLite 中用条件 UPDATE 把计划 pending -> executing 原子认领并立即提交，
+再复核与删除；只有认领成功者会触碰候选，竞争失败的进程直接返回 409。
+认领独立成事务持久化，认领后异常或崩溃留下不可重放的 executing 计划。
 """
 from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import time
 import uuid
@@ -298,10 +304,13 @@ class Registry:
     #
     # 两阶段复核：
     #   dry-run  -> 快照候选清单并持久化为 plan（plan_id），只出报告不删除；
-    #   execute  -> 必须携带 dry-run 返回的 plan_id；执行时在同一把锁内
-    #               重算可达性/租约，只删除“计划内且仍符合条件”的对象。
+    #   execute  -> 必须携带 dry-run 返回的 plan_id；执行前先在 SQLite 中
+    #               原子认领（pending+未过期 -> executing，立即提交），再在
+    #               同一把进程锁内重算可达性/租约，只删除“计划内且仍符合
+    #               条件”的对象，删除完成后才标记 executed。
     # 这样 dry-run 之后新产生的垃圾（如标签移动刚制造的不可达对象）不在计划内，
-    # 绝不会被未审阅地删除；重新可达或续租的对象自动跳过。
+    # 绝不会被未审阅地删除；重新可达或续租的对象自动跳过。跨进程并发执行同一
+    # 计划时，只有原子认领的胜者能删除，败者返回 409 且不碰任何候选。
 
     PLAN_TTL_SECONDS = 3600              # 计划生成后 1 小时内有效
     EXECUTED_PLAN_RETENTION_SECONDS = 7 * 24 * 3600
@@ -442,25 +451,73 @@ class Registry:
     def gc_execute(self, plan_id: "str | None") -> dict:
         """按已复核计划执行 GC。
 
-        拒绝条件（不删任何数据）：plan_id 缺失、未知、生成已超过 1 小时、已执行。
-        执行时在锁内以计划记录的宽限期重算可达性与租约：只删除计划内仍符合
-        条件的对象；计划外的新候选、重新可达或续租的对象一律跳过。
+        拒绝条件（不删任何数据）：plan_id 缺失、未知、生成已超过 1 小时、
+        已执行、正被另一个执行者（或崩溃的前执行者）认领。
+
+        执行顺序：
+          1. 先在 SQLite 把计划从 pending 原子认领为 executing 并立即提交——
+             跨进程共享数据目录时也只有一个请求能认领成功，败者拿到 409；
+          2. 在进程锁内以计划记录的宽限期重算可达性与租约，只删除计划内仍
+             符合条件的对象；计划外的新候选、重新可达或续租的一律跳过；
+          3. 删除全部完成后才标记 executed。
+        认领一旦提交即不可重放：之后任何异常/崩溃都保留 executing 状态，
+        重试返回 409，剩余候选可重新 dry-run 审阅。
         """
         if not plan_id or not isinstance(plan_id, str) or not plan_id.strip():
             raise E.gc_plan_required()
         plan_id = plan_id.strip()
-        with self.lock:
-            plan = self.db.get_gc_plan(plan_id)
-            if plan is None:
-                raise E.gc_plan_unknown(plan_id)
-            if plan["state"] == "executed":
-                raise E.gc_plan_already_executed(
-                    plan_id, _iso(plan["executed_at"]) if plan["executed_at"] else None
-                )
-            now = time.time()
-            if plan["expires_at"] <= now:
-                raise E.gc_plan_expired(plan_id, _iso(plan["expires_at"]))
 
+        owner = f"{os.getpid()}@{socket.gethostname()}"
+
+        # 保留未知/已执行/执行中计划的原有错误判定（认领前先区分，避免把
+        # 404 误报成 409）。过期在原子认领中判定（pending 窗口可能正好关闭）。
+        existing = self.db.get_gc_plan(plan_id)
+        if existing is None:
+            raise E.gc_plan_unknown(plan_id)
+        if existing["state"] == "executed":
+            raise E.gc_plan_already_executed(
+                plan_id, _iso(existing["executed_at"]) if existing["executed_at"] else None
+            )
+        if existing["state"] == "executing":
+            raise E.gc_plan_in_progress(
+                plan_id,
+                _iso(existing["claimed_at"]) if existing["claimed_at"] else None,
+                existing["claimed_by"],
+            )
+
+        # ---- 跨进程原子认领：pending 且未过期才能翻转为 executing ----
+        status, plan = self.db.claim_gc_plan(plan_id, time.time(), owner)
+        if status == "claimed":
+            pass  # 唯一胜者：认领已提交，下面开始复核与删除
+        elif status == "expired":
+            raise E.gc_plan_expired(plan_id, _iso(existing["expires_at"]))
+        else:
+            # 竞态落败：另一进程已认领（或计划状态刚被改变）。重新读取以
+            # 返回与当前状态一致的错误；无论哪种都不碰候选。
+            current = self.db.get_gc_plan(plan_id)
+            if current is None:
+                raise E.gc_plan_unknown(plan_id)
+            if current["state"] == "executed":
+                raise E.gc_plan_already_executed(
+                    plan_id, _iso(current["executed_at"]) if current["executed_at"] else None
+                )
+            if current["state"] == "pending" and current["expires_at"] <= time.time():
+                raise E.gc_plan_expired(plan_id, _iso(current["expires_at"]))
+            raise E.gc_plan_in_progress(
+                plan_id,
+                _iso(current["claimed_at"]) if current["claimed_at"] else None,
+                current["claimed_by"],
+            )
+
+        # 认领者的后续工作在 try 之外也保持 executing：本方法不捕获异常、
+        # 不回滚认领——进程崩溃同样留下 executing，杜绝同一计划被重放。
+        return self._gc_run_claimed(plan)
+
+    def _gc_run_claimed(self, plan: dict) -> dict:
+        """认领成功后的复核与删除（调用时计划已是 executing 且已持久化）。"""
+        plan_id = plan["id"]
+        with self.lock:
+            now = time.time()
             grace = plan["grace_seconds"]
             grace_cutoff = now - grace
             reachable_manifests, reachable_blobs = self._reachable_sets()
@@ -530,7 +587,9 @@ class Registry:
             for d in digests:
                 self.storage.delete_blob(d)  # 崩溃残留由启动时 sweep 兜底
 
-            self.db.mark_gc_plan_executed(plan_id, now)
+            # 全部删除成功后才允许计划进入 executed
+            executed_at = time.time()
+            self.db.mark_gc_plan_executed(plan_id, executed_at)
 
             return {
                 "dry_run": False,
@@ -538,7 +597,7 @@ class Registry:
                 "plan_id": plan_id,
                 "grace_seconds": grace,
                 "generated_at": _iso(plan["created_at"]),
-                "executed_at": _iso(now),
+                "executed_at": _iso(executed_at),
                 "summary": {
                     "blobs_deleted": len(delete_blobs),
                     "manifests_deleted": len(delete_manifests),

@@ -1,6 +1,8 @@
 """端到端测试：上传/续传/去重、manifest CAS、GC dry-run 与并发安全。"""
 import hashlib
 import json
+import multiprocessing as mp
+import os
 import threading
 import time
 
@@ -603,6 +605,198 @@ def test_gc_plan_survives_restart_and_executes_once(settings):
     dup = c2.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
     assert dup.status_code == 409
     assert dup.json()["errors"][0]["code"] == "GC_PLAN_ALREADY_EXECUTED"
+
+
+# ---------------- GC 执行认领：跨进程只能有一个执行者 ----------------
+
+def test_gc_execute_claim_is_persisted_as_executing_state(client):
+    """认领把计划翻成 executing；认领之后删除阶段抛错，计划保持 executing 不可重放。"""
+    registry = client.app.state.registry
+    garbage = push_blob(client, "app", b"crashed mid execution")
+    _age_all_blobs(registry)
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+
+    def boom(_digest):
+        raise RuntimeError("simulated crash after claim")
+
+    # 认领已提交后、删除 blob 文件时模拟进程崩溃
+    registry.storage.delete_blob = boom
+    with pytest.raises(RuntimeError):
+        client.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
+
+    row = registry.db.get_gc_plan(plan["plan_id"])
+    assert row["state"] == "executing"
+    assert row["claimed_at"] is not None
+    assert str(os.getpid()) in (row["claimed_by"] or "")
+
+    # 元数据已按“先元数据后文件”删除；计划不可重放：重试 409 且不触碰候选
+    retry = client.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
+    assert retry.status_code == 409
+    assert retry.json()["errors"][0]["code"] == "GC_PLAN_IN_PROGRESS"
+    assert client.get(f"/v2/app/blobs/{garbage}").status_code == 404
+
+    # 重启也不能重放：新实例看到持久化的 executing 计划
+    settings = client.app.state.registry.settings
+    c2 = TestClient(create_app(settings))
+    again = c2.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
+    assert again.status_code == 409
+    assert again.json()["errors"][0]["code"] == "GC_PLAN_IN_PROGRESS"
+
+    # 剩余候选可以重新 dry-run 审阅（计划本身永远不会被再执行）
+    push_blob(c2, "app", b"remaining garbage")
+    with c2.app.state.registry.lock:
+        c2.app.state.registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        c2.app.state.registry.db._conn.commit()
+    review = c2.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert digest_of(b"remaining garbage") in {
+        b["digest"] for b in review["delete"]["blobs"]
+    }
+
+
+def test_gc_concurrent_execute_same_plan_in_process(client):
+    """同进程多线程同时执行同一 plan_id：只有一个 200，败者 409，候选只删一次。"""
+    registry = client.app.state.registry
+    garbage = push_blob(client, "app", b"same-plan race")
+    _age_all_blobs(registry)
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+
+    barrier = threading.Barrier(4)
+    results = []
+
+    def execute():
+        barrier.wait()
+        r = client.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
+        results.append((r.status_code, r.json()))
+
+    threads = [threading.Thread(target=execute) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    statuses = sorted(s for s, _ in results)
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == 3
+    codes = {body["errors"][0]["code"] for s, body in results if s == 409}
+    # 败者观察到“执行中”或胜者已收尾的“已执行”，两者都是 409 且都不删数据
+    assert codes <= {"GC_PLAN_IN_PROGRESS", "GC_PLAN_ALREADY_EXECUTED"}
+    assert codes
+    assert client.get(f"/v2/app/blobs/{garbage}").status_code == 404
+
+
+def _gc_worker(data_dir, plan_id, result_q, start_event, slow,
+               claimed_event=None):
+    """独立进程：打开自己的 Registry/HTTP app，等待同步后执行同一计划。"""
+    settings = Settings(data_dir=data_dir, upload_lease_seconds=3600,
+                        gc_grace_seconds=3600)
+    app = create_app(settings)
+    if claimed_event is not None:
+        # 认领一提交就通知父进程，便于精确卡住 executing 窗口
+        orig_claim = app.state.registry.db.claim_gc_plan
+
+        def claim_and_signal(pid, now, owner):
+            status, plan = orig_claim(pid, now, owner)
+            if status == "claimed":
+                claimed_event.set()
+            return status, plan
+
+        app.state.registry.db.claim_gc_plan = claim_and_signal
+    if slow:
+        # 认领成功后拖慢文件删除，给另一进程留出观察 executing 的窗口
+        orig_delete = app.state.registry.storage.delete_blob
+
+        def slow_delete(digest):
+            time.sleep(4.0)
+            return orig_delete(digest)
+
+        app.state.registry.storage.delete_blob = slow_delete
+    with TestClient(app) as c:
+        start_event.wait()
+        r = c.post("/gc", json={"dry_run": False, "plan_id": plan_id})
+        result_q.put((r.status_code, r.json()))
+
+
+def test_gc_two_processes_same_plan_only_one_deletes(settings):
+    """两个独立进程同时 dry_run:false + 同一 plan_id：唯一胜者删除，败者 409 不碰候选。"""
+    ctx = mp.get_context("spawn")
+    c1 = TestClient(create_app(settings))
+    garbage = push_blob(c1, "app", b"cross process garbage")
+    with c1.app.state.registry.lock:
+        c1.app.state.registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        c1.app.state.registry.db._conn.commit()
+    plan = c1.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    # 让生成计划的进程彻底关闭对 SQLite 的连接，避免旁观者持锁
+    c1.app.state.registry.db._conn.close()
+
+    result_q = ctx.Queue()
+    start = ctx.Event()
+    procs = [
+        ctx.Process(target=_gc_worker,
+                    args=(str(settings.data_dir), plan["plan_id"], result_q, start, True)),
+        ctx.Process(target=_gc_worker,
+                    args=(str(settings.data_dir), plan["plan_id"], result_q, start, False)),
+    ]
+    for p in procs:
+        p.start()
+    start.set()
+    outcomes = [result_q.get(timeout=30) for _ in procs]
+    for p in procs:
+        p.join(timeout=10)
+        assert p.exitcode == 0
+
+    statuses = sorted(s for s, _ in outcomes)
+    assert statuses == [200, 409]
+    loser = next(body for s, body in outcomes if s == 409)
+    # 败者可能撞在 executing 窗口，也可能等看到胜者已标 executed：均为 409
+    assert loser["errors"][0]["code"] in (
+        "GC_PLAN_IN_PROGRESS", "GC_PLAN_ALREADY_EXECUTED"
+    )
+    winner = next(body for s, body in outcomes if s == 200)
+    assert winner["summary"]["blobs_deleted"] == 1
+
+    c2 = TestClient(create_app(settings))
+    assert c2.get(f"/v2/app/blobs/{garbage}").status_code == 404
+    assert c2.app.state.registry.db.get_gc_plan(plan["plan_id"])["state"] == "executed"
+
+
+def test_gc_executing_plan_rejected_without_touching_other_candidates(settings):
+    """计划卡在 executing（胜者慢/崩溃）时：并发请求 409，且不会删除任何候选。"""
+    ctx = mp.get_context("spawn")
+    c1 = TestClient(create_app(settings))
+    garbage = push_blob(c1, "app", b"busy winner garbage")
+    with c1.app.state.registry.lock:
+        c1.app.state.registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        c1.app.state.registry.db._conn.commit()
+    plan = c1.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    c1.app.state.registry.db._conn.close()
+
+    result_q = ctx.Queue()
+    start = ctx.Event()
+    claimed = ctx.Event()
+    winner = ctx.Process(target=_gc_worker,
+                         args=(str(settings.data_dir), plan["plan_id"],
+                               result_q, start, True, claimed))
+    winner.start()
+    start.set()
+    assert claimed.wait(timeout=15)  # 等胜者持久化认领、进入删除窗口
+
+    # 第二个进程此时执行同一计划：必然 409 GC_PLAN_IN_PROGRESS
+    late = TestClient(create_app(settings))
+    r = late.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
+    assert r.status_code == 409
+    err = r.json()["errors"][0]
+    assert err["code"] == "GC_PLAN_IN_PROGRESS"
+    assert err["detail"]["plan_id"] == plan["plan_id"]
+    # 败者完全没碰候选：blob 文件仍在磁盘（胜者在慢删除窗口里还没 unlink；
+    # 元数据 404 是胜者“先元数据后文件”顺序所致，与败者无关）
+    assert settings.blobs_dir.joinpath(
+        "sha256", garbage.split(":", 1)[1]
+    ).exists()
+
+    assert result_q.get(timeout=30)[0] == 200
+    winner.join(timeout=10)
+    assert winner.exitcode == 0
+    assert late.get(f"/v2/app/blobs/{garbage}").status_code == 404
 
 
 # ---------------- 重启恢复 ----------------

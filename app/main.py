@@ -250,9 +250,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         """两阶段复核 GC。
 
         - dry_run=true（默认）：生成持久化计划，返回 plan_id 与候选清单；
-        - dry_run=false：必须携带 plan_id；计划缺失/未知/超过 1 小时/已执行
-          均拒绝（4xx）且不删数据。执行时重算可达性与租约，只删计划内仍符合
-          条件的对象，计划外新候选一律不碰。
+        - dry_run=false：必须携带 plan_id；计划缺失/未知/超过 1 小时/已执行/
+          正被其他进程执行均拒绝（4xx）且不删数据。执行前先在 SQLite 原子认领
+          计划（pending -> executing），跨进程并发时只有认领成功者删除，败者
+          返回 409 GC_PLAN_IN_PROGRESS；认领后重算可达性与租约，只删计划内仍
+          符合条件的对象，计划外新候选一律不碰，删除完成后才标记 executed。
         """
         req = req or GCRequest()
         if req.dry_run:
